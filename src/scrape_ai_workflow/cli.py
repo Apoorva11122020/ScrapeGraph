@@ -12,7 +12,7 @@ from .settings import Settings, load_settings
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Excel companies → Google website URL → ScrapeGraphAI Extract → Excel/CSV.",
+        description="Excel companies -> Google website URL -> ScrapeGraphAI Extract -> Excel/CSV.",
     )
     p.add_argument(
         "--input",
@@ -42,7 +42,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--header-row", type=int, default=1, help="0-based pandas header row index (client sheet uses 1).")
     p.add_argument("--limit", type=int, default=None, help="Process only first N data rows (testing).")
     p.add_argument("--checkpoint-every", type=int, default=5, help="Flush checkpoint every N completed rows.")
-    p.add_argument("--fresh", action="store_true", help="Ignore existing checkpoint contents.")
+    run_mode = p.add_mutually_exclusive_group(required=True)
+    run_mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from last_run checkpoint; merge and update the same --output-xlsx file.",
+    )
+    run_mode.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start over: reset checkpoint and rebuild output Excel from scratch.",
+    )
     p.add_argument(
         "--retry-failed",
         action="store_true",
@@ -105,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         checkpoint_every=args.checkpoint_every,
         fresh=args.fresh,
+        resume=args.resume,
         retry_failed=args.retry_failed,
         urls_only=args.urls_only,
     )

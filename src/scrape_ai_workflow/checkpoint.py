@@ -24,11 +24,25 @@ def row_is_success(row: dict[str, Any]) -> bool:
     url = str(row.get("website_url") or "").strip()
     if not url or not url.startswith("http"):
         return False
-    if status == "ok":
-        return True
-    if status == "name_mismatch_review":
+    if status in ("ok", "name_mismatch_review", "url_found"):
         return True
     return False
+
+
+def merge_excel_rows_into_checkpoint(cp: dict[str, Any], rows: list[dict[str, Any]]) -> int:
+    """Import rows from existing output Excel into checkpoint (won't overwrite checkpoint success)."""
+    merged = 0
+    for row in rows:
+        name = str(row.get("company_name") or "").strip()
+        if not name:
+            continue
+        key = row_key(row.get("sr_no"), name)
+        existing = cp.get("rows", {}).get(key)
+        if existing and row_is_success(existing):
+            continue
+        cp.setdefault("rows", {})[key] = row
+        merged += 1
+    return merged
 
 
 def load_checkpoint(path: Path | None) -> dict[str, Any]:

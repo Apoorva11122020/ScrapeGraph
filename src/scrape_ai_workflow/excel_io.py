@@ -58,6 +58,51 @@ def build_output_row(
     }
 
 
+def read_output_rows(xlsx_path: Path) -> list[dict[str, Any]]:
+    """Load rows from an existing output workbook (empty list if missing)."""
+    p = Path(xlsx_path)
+    if not p.is_file():
+        return []
+    df = pd.read_excel(p, engine="openpyxl")
+    return df.to_dict(orient="records")
+
+
+def build_ordered_output_rows(
+    df: pd.DataFrame,
+    cp_rows: dict[str, Any],
+    *,
+    n: int,
+    row_key_fn,
+) -> list[dict[str, Any]]:
+    """One output row per input sheet row (in order); checkpoint data or pending placeholder."""
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        r = df.iloc[i]
+        sr_no = r.get("SR NO")
+        company = r.get("COMPANY NAME")
+        company_s = (
+            ""
+            if company is None or (isinstance(company, float) and str(company) == "nan")
+            else str(company).strip()
+        )
+        key = row_key_fn(sr_no, company_s)
+        if key in cp_rows:
+            rows.append(cp_rows[key])
+        else:
+            rows.append(
+                build_output_row(
+                    sr_no=sr_no,
+                    company_name=company_s,
+                    website_url="",
+                    extracted={},
+                    status="pending",
+                    error_detail="",
+                    scraped_at="",
+                )
+            )
+    return rows
+
+
 def write_outputs(rows: list[dict[str, Any]], xlsx_path: Path, csv_path: Path | None) -> None:
     df = pd.DataFrame(rows)
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
