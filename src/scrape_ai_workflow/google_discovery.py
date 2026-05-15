@@ -135,17 +135,19 @@ def _get_browser_context(settings: Settings):
 
 
 def _extract_bing_results(page) -> list[tuple[str, str, str]]:
-    """Extract organic search results from Bing SERP page."""
+    """Extract organic search results from Bing SERP page — handles multiple layouts."""
     results: list[tuple[str, str, str]] = []
 
+    # Wait for any of several possible result containers
     try:
-        page.wait_for_selector("#b_results li.b_algo", timeout=15000)
+        page.wait_for_selector("#b_results, .b_results, ol#b_results", timeout=15000)
     except Exception:
         pass
 
     html = page.content()
     soup = BeautifulSoup(html, "html.parser")
 
+    # Strategy 1: Standard Bing layout
     for item in soup.select("#b_results li.b_algo"):
         a_tag = item.select_one("h2 a[href]")
         if not a_tag:
@@ -154,10 +156,65 @@ def _extract_bing_results(page) -> list[tuple[str, str, str]]:
         if not href.startswith("http"):
             continue
         title = a_tag.get_text(" ", strip=True)
-        snippet_el = item.select_one(".b_caption p, .b_algoSlug")
+        snippet_el = item.select_one(".b_caption p, .b_algoSlug, .b_lineclamp2, .b_lineclamp3")
         snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
         if not _is_blocked(href):
             results.append((href, title, snippet))
+
+    # Strategy 2: Alternate selectors (headless mode sometimes gets different markup)
+    if not results:
+        for a_tag in soup.select("li.b_algo a[href], .b_algo h2 a[href], cite + a[href]"):
+            href = a_tag.get("href", "").strip()
+            if not href.startswith("http"):
+                continue
+            title = a_tag.get_text(" ", strip=True)
+            if not _is_blocked(href) and href not in [r[0] for r in results]:
+                results.append((href, title, ""))
+
+    # Strategy 3: Any links that look like organic results (last resort)
+    if not results:
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"].strip()
+            if not href.startswith("http"):
+                continue
+            # Skip Bing internal links
+            if "bing.com" in href or "microsoft.com" in href or "msn.com" in href:
+                continue
+            if "/search?" in href or "/images/" in href:
+                continue
+            title = a_tag.get_text(" ", strip=True)
+            if len(title) < 3:
+                continue
+            if not _is_blocked(href) and href not in [r[0] for r in results]:
+                results.append((href, title, ""))
+
+    # Debug: if still no results, log what Bing actually returned
+    if not results:
+        title_tag = soup.find("title")
+        page_title = title_tag.get_text() if title_tag else "no title"
+        log.warning("Bing returned 0 parseable results. Page title: %r, HTML length: %d", page_title, len(html))
+        # Check for cookie consent / captcha
+        if "cookie" in html.lower() or "consent" in html.lower():
+            log.warning("Bing may be showing cookie consent page — trying to dismiss...")
+            try:
+                # Try clicking accept button
+                accept_btn = page.query_selector("#bnp_btn_accept, .bnp_btn_accept, button[id*='accept']")
+                if accept_btn:
+                    accept_btn.click()
+                    time.sleep(2)
+                    # Re-extract after dismissing
+                    html = page.content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    for item in soup.select("#b_results li.b_algo"):
+                        a_tag = item.select_one("h2 a[href]")
+                        if not a_tag:
+                            continue
+                        href = a_tag.get("href", "").strip()
+                        if href.startswith("http") and not _is_blocked(href):
+                            title = a_tag.get_text(" ", strip=True)
+                            results.append((href, title, ""))
+            except Exception:
+                pass
 
     return results
 
@@ -183,9 +240,19 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
         page = context.new_page()
 
         try:
-            # Navigate directly to Bing search URL
-            search_url = "https://www.bing.com/search?q=" + query.replace(" ", "+") + "&setlang=en"
+            # First visit: dismiss cookie consent if present
+            search_url = "https://www.bing.com/search?q=" + query.replace(" ", "+") + "&setlang=en&cc=us"
             page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Try to dismiss any cookie/consent overlay
+            try:
+                accept_btn = page.query_selector("#bnp_btn_accept, .bnp_btn_accept, #bnp_ttc_close, button[id*='accept'], #consent-accept")
+                if accept_btn:
+                    accept_btn.click()
+                    print("  🍪 Dismissed cookie consent.", flush=True)
+                    time.sleep(1.5)
+            except Exception:
+                pass
 
             # Small random wait to appear human
             time.sleep(random.uniform(1.5, 3.0))
@@ -197,7 +264,7 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
                 # Try alternate query variant
                 query2 = build_search_query(company_name, variant=2)
                 print(f"  🔄 Retrying with: {query2!r}", flush=True)
-                search_url2 = "https://www.bing.com/search?q=" + query2.replace(" ", "+") + "&setlang=en"
+                search_url2 = "https://www.bing.com/search?q=" + query2.replace(" ", "+") + "&setlang=en&cc=us"
                 page.goto(search_url2, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(random.uniform(1.5, 2.5))
                 results = _extract_bing_results(page)
@@ -207,7 +274,7 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
                 # Last resort: variant 1
                 query3 = build_search_query(company_name, variant=1)
                 print(f"  🔄 Retrying with: {query3!r}", flush=True)
-                search_url3 = "https://www.bing.com/search?q=" + query3.replace(" ", "+") + "&setlang=en"
+                search_url3 = "https://www.bing.com/search?q=" + query3.replace(" ", "+") + "&setlang=en&cc=us"
                 page.goto(search_url3, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(random.uniform(1.5, 2.5))
                 results = _extract_bing_results(page)
@@ -215,6 +282,16 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
 
             if not results:
                 print(f"  ❌ No results from Bing for: {company_name!r}", flush=True)
+                # Save debug HTML for first failure
+                try:
+                    from pathlib import Path
+                    debug_dir = Path("logs")
+                    debug_dir.mkdir(exist_ok=True)
+                    debug_file = debug_dir / "bing_debug_last.html"
+                    debug_file.write_text(page.content(), encoding="utf-8")
+                    print(f"  💾 Debug HTML saved to: {debug_file}", flush=True)
+                except Exception:
+                    pass
                 return GooglePick(None, "bing_no_results", f"query={query}")
 
             best, score, detail = pick_best_url(company_name, results)
