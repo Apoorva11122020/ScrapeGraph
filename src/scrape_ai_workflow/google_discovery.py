@@ -48,6 +48,8 @@ _DEFAULT_BLOCKED = (
 
 GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 _CSE_NOT_CONFIGURED_LOGGED = False
+# Shared cooldown when DDG returns 202 Ratelimit (stop hammering).
+_RATELIMIT_UNTIL: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -143,16 +145,47 @@ def _rank_hits(company_name: str, hits: list[dict]) -> GooglePick:
     return GooglePick(best, "picked", f"{detail}; score={score:.1f}")
 
 
+def _is_ratelimit_error(exc: BaseException | str) -> bool:
+    msg = str(exc).lower()
+    return "ratelimit" in msg or "rate limit" in msg or "202 ratelimit" in msg
+
+
+def _wait_ddg_cooldown(settings: Settings) -> None:
+    global _RATELIMIT_UNTIL
+    now = time.time()
+    if now < _RATELIMIT_UNTIL:
+        wait = _RATELIMIT_UNTIL - now
+        log.warning("DDG rate limit: waiting %.0f seconds before next search...", wait)
+        time.sleep(wait)
+
+
+def _mark_ddg_ratelimit(settings: Settings) -> None:
+    global _RATELIMIT_UNTIL
+    _RATELIMIT_UNTIL = time.time() + settings.ddg_ratelimit_cooldown_s
+    log.warning(
+        "DDG rate limit hit — pausing all searches for %.0f seconds.",
+        settings.ddg_ratelimit_cooldown_s,
+    )
+
+
 def _ddg_api_search(company_name: str, query: str) -> GooglePick:
     try:
         from duckduckgo_search import DDGS
     except ImportError:
         return GooglePick(None, "ddg_api_missing", "pip install duckduckgo-search")
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
+    try:
         with DDGS() as ddgs:
-            hits = list(ddgs.text(query, max_results=15, region="in-in"))
+            hits = list(ddgs.text(query, max_results=12, backend="bing"))
+            if not hits:
+                hits = list(ddgs.text(query, max_results=12, backend="auto"))
+    except Exception as e:
+        if _is_ratelimit_error(e):
+            return GooglePick(None, "ddg_ratelimit", str(e))
+        return GooglePick(None, "ddg_api_error", str(e))
+
+    if not hits:
+        return GooglePick(None, "ddg_no_results", "empty result set")
     return _rank_hits(company_name, hits)
 
 
@@ -187,44 +220,46 @@ def _ddg_html_search(company_name: str, query: str) -> GooglePick:
 
 def _discover_duckduckgo(company_name: str, settings: Settings) -> GooglePick:
     """
-    Free search: duckduckgo-search library (primary) with optional HTML fallback.
-    Tries 3 query variants; retries API on transient errors.
+    Free search via duckduckgo-search (v8+ often uses Bing — more stable than html/lite).
+    One query per company by default; long cooldown on 202 Ratelimit.
     """
+    _wait_ddg_cooldown(settings)
+    delay = max(5.0, settings.ddg_delay_s)
+    max_variants = max(1, min(3, settings.ddg_max_variants))
     last: GooglePick = GooglePick(None, "not_tried", "")
-    delay = max(1.0, settings.ddg_delay_s)
 
-    for variant in range(3):
+    for variant in range(max_variants):
         query = build_search_query(company_name, variant=variant)
-        for attempt in range(min(2, settings.ddg_api_retries)):
+        for attempt in range(max(1, settings.ddg_api_retries)):
             if attempt > 0:
-                time.sleep(delay * attempt)
-            try:
-                pick = _ddg_api_search(company_name, query)
-            except Exception as e:
-                pick = GooglePick(None, "ddg_api_error", str(e))
-                log.warning("DDG API %r variant=%s attempt=%s: %s", company_name, variant, attempt, e)
-                continue
+                time.sleep(delay)
+
+            pick = _ddg_api_search(company_name, query)
+
+            if pick.status == "ddg_ratelimit":
+                _mark_ddg_ratelimit(settings)
+                return pick
 
             if pick.url:
-                pick = GooglePick(pick.url, f"picked_v{variant}", pick.detail)
-                return pick
+                time.sleep(delay)
+                return GooglePick(pick.url, f"picked_v{variant}", pick.detail)
 
             last = pick
             if pick.status == "low_confidence":
                 break
-            if pick.status in ("ddg_api_error", "no_usable_links", "not_tried"):
-                continue
 
         time.sleep(delay)
 
-    if settings.ddg_use_html_fallback:
-        for variant in range(2):
-            query = build_search_query(company_name, variant=variant)
-            time.sleep(delay)
-            html_pick = _ddg_html_search(company_name, query)
-            if html_pick.url:
-                return html_pick
-            last = html_pick
+    if settings.ddg_use_html_fallback and last.status != "ddg_ratelimit":
+        query = build_search_query(company_name, variant=0)
+        time.sleep(delay)
+        html_pick = _ddg_html_search(company_name, query)
+        if html_pick.status == "ddg_http_error" and "202" in html_pick.detail:
+            _mark_ddg_ratelimit(settings)
+            return GooglePick(None, "ddg_ratelimit", html_pick.detail)
+        if html_pick.url:
+            return html_pick
+        last = html_pick
 
     return last
 

@@ -26,6 +26,8 @@ class Settings:
     ddg_delay_s: float
     ddg_api_retries: int
     ddg_use_html_fallback: bool
+    ddg_ratelimit_cooldown_s: float
+    ddg_max_variants: int
 
 
 def load_settings() -> Settings:
@@ -52,9 +54,11 @@ def load_settings() -> Settings:
         google_cse_cx=os.getenv("GOOGLE_CSE_CX") or None,
         search_playwright_fallback=_bool_env("SEARCH_PLAYWRIGHT_FALLBACK", default=False),
         cse_delay_s=float(os.getenv("CSE_DELAY_S", "0.25")),
-        ddg_delay_s=float(os.getenv("DDG_DELAY_S", "4.0")),
-        ddg_api_retries=int(os.getenv("DDG_API_RETRIES", "4")),
+        ddg_delay_s=float(os.getenv("DDG_DELAY_S", "15.0")),
+        ddg_api_retries=int(os.getenv("DDG_API_RETRIES", "1")),
         ddg_use_html_fallback=_bool_env("DDG_USE_HTML_FALLBACK", default=False),
+        ddg_ratelimit_cooldown_s=float(os.getenv("DDG_RATELIMIT_COOLDOWN_S", "120")),
+        ddg_max_variants=int(os.getenv("DDG_MAX_VARIANTS", "1")),
     )
 
 

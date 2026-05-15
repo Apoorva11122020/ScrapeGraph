@@ -116,15 +116,18 @@ def _similarity(a: str, b: str) -> float:
 
 
 def _token_in_host(tok: str, host: str) -> bool:
-    """Avoid false positives like 'dl' inside mcpedl.com — match domain labels."""
+    """Match domain labels; short tokens must be a label prefix (dl → dlinternational.com)."""
     host = host.replace("www.", "")
-    labels = re.split(r"[.\-]", host)
+    labels = [lb for lb in re.split(r"[.\-]", host) if lb]
     labels_flat = "".join(labels)
     if tok in labels:
         return True
     if len(tok) >= 4 and tok in labels_flat:
         return True
     if len(tok) <= 3:
+        for label in labels:
+            if label.startswith(tok) and len(label) >= len(tok) + 3:
+                return True
         return False
     return tok in host
 
