@@ -1,9 +1,251 @@
 # ScrapeAI — Agent Handoff (read this first)
 
-**Last updated:** 2026-05-15  
+**Last updated:** 2026-05-15 (v2 — Playwright+Bing search)
 **Repo:** `git@github.com:Apoorva11122020/ScrapeGraph.git` (branch `master`)  
 **Workspace:** `C:\Users\Lenovo\Desktop\ScrapeAI`  
-**Prior chat transcript:** `.cursor/projects/.../agent-transcripts/2659e5a0-d2a8-4fe6-a56c-7b9f2b21149c.jsonl`
+
+---
+
+## 1. One-line goal
+
+Read company names from client Excel → discover **official website URL** per company → call **ScrapeGraphAI v2 Extract** with client prompt/schema → write **Excel/CSV** with emails/contacts; **every row kept** (failures = blank fields + `status` + `error_detail`).
+
+---
+
+## 2. Client constraints (non-negotiable)
+
+| Constraint | Detail |
+|------------|--------|
+| Pay only for **ScrapeGraphAI** (for now) | Client does **not** want paid Google Custom Search API billed yet; discuss **later** for ~20k scale. |
+| URL discovery scope | Script finds **base website URL** only. "Contact Us" / email priority is in **ScrapeGraph extraction prompt** (`schema_prompts.py`). |
+| Trial input | `apoorva trail sheet.xlsx` — **~90 companies**, column `COMPANY NAME`, pandas `header=1` (Excel header row 2). |
+| Future scale | **~20,000** companies later — need checkpoint/resume (already built). |
+| ScrapeGraph credits | Demo account ~**475 credits**, ~**5 credits/company** — **do not burn** until URL step is acceptable. Keep `DRY_RUN_EXTRACT=true` until URL QA passes. |
+
+---
+
+## 3. What is built (status)
+
+### Package: `src/scrape_ai_workflow/`
+
+| Module | Role |
+|--------|------|
+| `excel_io.py` | Read sheet; write output columns |
+| `pipeline.py` | E2E orchestration, summary JSON, logging; calls `close_browser()` at end |
+| `checkpoint.py` | Resume; `row_is_success()` skips only rows with valid URL + ok/mismatch status |
+| `google_discovery.py` | URL discovery: **Playwright+Bing** (default), CSE (if keys), DuckDuckGo (legacy fallback) |
+| `url_ranking.py` | Score/rank SERP candidates; block directories/social; `MIN_ACCEPT_SCORE=3.0` |
+| `search_query.py` | Short query: `"{name} India company website"` (long queries returned empty) |
+| `scrapegraph_client.py` | POST Extract API; honors `DRY_RUN_EXTRACT` |
+| `schema_prompts.py` | Client extraction prompt + JSON schema |
+| `settings.py` | `.env` loading; includes `playwright_search_delay_s` |
+| `cli.py` / `__main__.py` | CLI flags |
+
+### Output columns
+
+`sr_no`, `company_name`, `website_url`, `company_name_extracted`, `email1..3`, `contact1..3`, `status`, `error_detail`, `scraped_at`, `url_match_score`
+
+### CLI highlights
+
+```powershell
+cd "C:\Users\Lenovo\Desktop\ScrapeAI"
+pip install -r requirements.txt
+playwright install chromium        # FIRST TIME ONLY — downloads ~130MB browser
+$env:PYTHONPATH = ".\src"
+
+# URL only, no ScrapeGraph credits (recommended first step)
+python -m scrape_ai_workflow --live-google --urls-only --limit 5 --fresh --print-summary
+
+# Full 90-company URL run
+python -m scrape_ai_workflow --live-google --urls-only --fresh --print-summary
+
+# Resume failed URL rows only
+python -m scrape_ai_workflow --live-google --urls-only --retry-failed --checkpoint ".\checkpoints\apoorva_urls.json"
+
+# Live extract (needs SCRAPEGRAPH_API_KEY)
+python -m scrape_ai_workflow --live-google --live-extract --limit 5 --print-summary
+```
+
+---
+
+## 4. Current `.env` (developer machine — do not commit secrets)
+
+```env
+SCRAPEGRAPH_API_KEY=          # empty until live extract testing
+DRY_RUN_EXTRACT=true
+MOCK_GOOGLE=false
+
+# ---- Search provider ----
+SEARCH_PROVIDER=playwright_bing   # NEW DEFAULT (was: duckduckgo)
+PLAYWRIGHT_SEARCH_DELAY_S=6.0
+
+GOOGLE_CSE_API_KEY=           # empty — client deferred to future scale
+GOOGLE_CSE_CX=
+CSE_DELAY_S=0.25
+```
+
+---
+
+## 5. Search provider — history & current approach
+
+### Why DuckDuckGo was replaced
+
+| Symptom | Cause |
+|---------|--------|
+| `202 Ratelimit` on DDG HTML/lite endpoints | IP throttled after a few queries |
+| `ddg_transport_error` / `ddg_http_error` | Network + rate limits on full 90-row run |
+| `ddg_no_results` | Empty SERP, IP throttling pattern |
+| `low_confidence` | Results returned but score below `MIN_ACCEPT_SCORE` |
+
+**Results from actual runs:**
+- Live DDG full 90: **5** `extract_ok`, **37** `ddg_http_error`, **39** `ddg_transport_error`, **9** `low_confidence`
+- Live test 5: **0/5 URLs** — 4× `ddg_no_results`, 1× `low_confidence`
+
+### Current approach: Playwright + Bing (v2)
+
+`SEARCH_PROVIDER=playwright_bing` → `_discover_playwright_bing()` in `google_discovery.py`
+
+**How it works:**
+1. Launches a **single headless Chromium** browser (reused across all 90 companies — fast)
+2. Navigates to `https://www.bing.com/search?q=...` per company
+3. Waits for results, parses `#b_results li.b_algo` (organic results)
+4. Passes candidates to `pick_best_url()` in `url_ranking.py`
+5. If no results → retries with variant queries (up to 3 variants)
+6. Polite 6–8s delay between searches (configurable via `PLAYWRIGHT_SEARCH_DELAY_S`)
+7. Blocks images/fonts/media for speed
+8. `close_browser()` called at end of pipeline run
+
+**Why Bing (not Google):**
+- Google.com → immediate `/sorry/` CAPTCHA (verified in earlier testing)
+- Bing is significantly less aggressive with automated browsing
+- ~90 companies at 8s/each ≈ **12–15 minutes total**, no rate limit issues expected
+
+**Why NOT DuckDuckGo API library:**
+- `duckduckgo-search` library uses Bing backend — same rate limits, without browser control
+- Observed ~5% success rate on 90-company run
+
+### Search provider summary
+
+| Provider | Setting | Use case |
+|----------|---------|----------|
+| `playwright_bing` | **DEFAULT** | 90-company demo — no API keys needed |
+| `cse` | `SEARCH_PROVIDER=cse` | 20k production — needs `GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_CX` |
+| `auto` | `SEARCH_PROVIDER=auto` | CSE if keys set, else Playwright Bing |
+| `duckduckgo` | `SEARCH_PROVIDER=duckduckgo` | Legacy fallback — NOT recommended |
+
+---
+
+## 6. First-time setup on new machine
+
+```powershell
+cd "C:\Users\Lenovo\Desktop\ScrapeAI"
+git pull origin master
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+playwright install chromium          # downloads Chromium browser binary
+```
+
+Then copy `.env.example` → `.env` and fill in `SCRAPEGRAPH_API_KEY` when ready.
+
+---
+
+## 7. Recommended next steps (priority order)
+
+### For 90-company demo
+
+**Step 1 — Run URL discovery:**
+```powershell
+$env:SEARCH_PROVIDER = "playwright_bing"
+$env:MOCK_GOOGLE = "false"
+python -m scrape_ai_workflow --live-google --urls-only --fresh --print-summary
+```
+
+**Step 2 — Review output:**
+Open `data/output/apoorva_urls_full.xlsx`, check `website_url` + `url_match_score` columns.  
+Manually correct any obvious wrong URLs.
+
+**Step 3 — Run ScrapeGraph extract:**
+Set `SCRAPEGRAPH_API_KEY` in `.env`, then:
+```powershell
+python -m scrape_ai_workflow --live-google --live-extract --limit 5 --print-summary
+```
+Smoke test with 5 rows, then full sheet.
+
+### For 20k production
+
+- Get client approval for **Google CSE** ($5/1000 queries) or **Brave Search API** (free tier: 1k/month)
+- Set `SEARCH_PROVIDER=auto` + `GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_CX` in `.env`
+- Keep checkpoint/resume; tune `CSE_DELAY_S`
+
+---
+
+## 8. ScrapeGraph API
+
+- **Endpoint:** `POST https://v2-api.scrapegraphai.com/api/extract`
+- **Header:** `SGAI-APIKEY: <key>`
+- **Body:** `{"url": "...", "prompt": "...", "schema": {...}}`
+- **Client module:** `scrapegraph_client.py`  
+- **Prompt/schema:** `schema_prompts.py` — use `build_extraction_prompt(expected_company_name)` per row.
+
+---
+
+## 9. Key paths
+
+| Path | Purpose |
+|------|---------|
+| `apoorva trail sheet.xlsx` | Trial input (~90 companies) |
+| `data/output/` | Outputs + `*.summary.json` |
+| `checkpoints/apoorva_urls.json` | URL-run checkpoint |
+| `checkpoints/last_run.json` | Default checkpoint |
+| `logs/run_*.log` | Per-run logs |
+| `.env` | Local secrets (gitignored) |
+| `.env.example` | Template |
+
+---
+
+## 10. Git / push notes
+
+- Remote: `origin` → `Apoorva11122020/ScrapeGraph.git`
+- Do **not** commit `.env`, API keys, or large client xlsx if gitignored.
+- Changed files in v2: `google_discovery.py`, `settings.py`, `pipeline.py`, `cli.py`, `.env.example`, `RUN_COMMANDS.md`, `HANDOFF.md`
+
+---
+
+## 11. Quick verification commands
+
+```powershell
+cd "C:\Users\Lenovo\Desktop\ScrapeAI"
+$env:PYTHONPATH = ".\src"
+
+# Dry pipeline smoke (no browser, no credits)
+python -m scrape_ai_workflow --limit 2 --fresh --print-summary
+
+# Live URL discovery smoke (5 companies via Playwright+Bing)
+python -m scrape_ai_workflow --live-google --urls-only --limit 5 --fresh --print-summary
+
+# Inspect output
+python -c "import pandas as pd; print(pd.read_excel('data/output/enriched.xlsx')[['company_name','website_url','status']])"
+```
+
+---
+
+## 12. Decision log
+
+| Decision | Rationale |
+|----------|-----------|
+| **Playwright + Bing** for URL discovery (v2) | DDG ~5% success rate on 90-company run; Bing doesn't CAPTCHA like Google |
+| Single shared browser instance | Reuse across all rows — faster startup, lower memory |
+| Short search queries | Long queries returned empty SERP |
+| `url_ranking.py` scoring | First organic link often wrong (directories, unrelated brands) |
+| Postpone live ScrapeGraph | Credits precious until URLs trustworthy |
+| Defer Google CSE to client future budget | Client wants ScrapeGraph-only billing for now |
+| DDG kept as fallback | In case Bing rate-limits in future; set `SEARCH_PROVIDER=duckduckgo` |
+
+---
+
+*End of handoff — start with §5 if debugging search; §6 for new machine setup; §7 for next steps.*
+
 
 ---
 

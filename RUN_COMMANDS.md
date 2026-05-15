@@ -6,18 +6,19 @@ Project folder:
 cd "C:\Users\Lenovo\Desktop\ScrapeAI"
 .\.venv\Scripts\Activate.ps1   # agar venv hai
 pip install -r requirements.txt
+playwright install chromium      # <-- IMPORTANT: first time only, downloads browser
 $env:PYTHONPATH = ".\src"
 ```
 
 ## 1) Sirf URLs dhoondho (ScrapeGraph credits nahi lagenge)
 
 Pehle yahi chalao — output check karo, phir extract.
+**Now uses Playwright + Bing (no rate limits, reliable)**
 
 ```powershell
-$env:SEARCH_PROVIDER = "duckduckgo"
-$env:DDG_DELAY_S = "5"
+$env:SEARCH_PROVIDER = "playwright_bing"
+$env:PLAYWRIGHT_SEARCH_DELAY_S = "6"
 $env:MOCK_GOOGLE = "false"
-$env:DDG_USE_HTML_FALLBACK = "false"
 
 python -m scrape_ai_workflow `
   --input ".\apoorva trail sheet.xlsx" `
@@ -31,7 +32,7 @@ python -m scrape_ai_workflow `
   --print-summary
 ```
 
-**~90 companies × 5 sec delay ≈ 8–12 min.** Internet stable rakho.
+**~90 companies × 8 sec avg ≈ 12–15 min.** Internet stable rakho.
 
 ## 2) Failed URLs dubara try (pehli run ke baad)
 
@@ -83,5 +84,9 @@ Pehle `--limit 5`, phir poori sheet.
 
 ## Tips
 
+- Uses **Playwright + Bing** (NOT DuckDuckGo anymore — DDG was rate limiting at ~5% success).
+- Playwright launches a headless Chromium browser, searches Bing, extracts results.
+- First time setup: `playwright install chromium` (downloads ~130MB browser binary).
 - Galat URL se bachne ke liye score threshold hai — agar match weak ho to row **blank** rahegi (`low_confidence`), manual review ke liye.
-- Rate limit aaye to `DDG_DELAY_S=6` ya `7` karke `--retry-failed` chalao.
+- If Bing blocks (unlikely for 90), increase `PLAYWRIGHT_SEARCH_DELAY_S=10` and retry failed.
+- For 20k companies later: switch to `SEARCH_PROVIDER=cse` with Google CSE keys.

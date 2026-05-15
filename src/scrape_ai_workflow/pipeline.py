@@ -9,7 +9,7 @@ from typing import Any
 
 from .checkpoint import load_checkpoint, merge_rows_into_checkpoint, row_is_success, row_key, save_checkpoint
 from .excel_io import build_output_row, read_company_sheet, write_outputs
-from .google_discovery import discover_official_website
+from .google_discovery import close_browser, discover_official_website
 from .scrapegraph_client import call_extract
 from .settings import Settings
 from .url_ranking import names_likely_match
@@ -166,6 +166,9 @@ def run_pipeline(
 
     if checkpoint_path:
         save_checkpoint(checkpoint_path, cp)
+
+    # Close shared Playwright browser
+    close_browser()
 
     write_outputs(rows_out, output_xlsx, output_csv)
 

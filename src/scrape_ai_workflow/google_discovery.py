@@ -4,15 +4,12 @@ import logging
 import random
 import re
 import time
-import warnings
 from dataclasses import dataclass
 from typing import Iterable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
 from .search_query import build_search_query
 from .settings import Settings
@@ -44,12 +41,15 @@ _DEFAULT_BLOCKED = (
     "duckduckgo.com",
     "bing.com",
     "springer.com",
+    "microsoft.com",
+    "msn.com",
 )
 
 GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
-_CSE_NOT_CONFIGURED_LOGGED = False
-# Shared cooldown when DDG returns 202 Ratelimit (stop hammering).
-_RATELIMIT_UNTIL: float = 0.0
+
+# ─── Shared browser instance for Playwright (reuse across calls) ───
+_BROWSER = None
+_BROWSER_CONTEXT = None
 
 
 @dataclass(frozen=True)
@@ -80,189 +80,148 @@ def _is_blocked(url: str, extra_blocked: Iterable[str] | None = None) -> bool:
     return False
 
 
-def _resolve_result_href(href: str) -> str | None:
-    if not href:
-        return None
-    h = href.strip()
-    if h.startswith("//"):
-        h = "https:" + h
+# ─────────────────────────────────────────────────────────────────────────────
+# PLAYWRIGHT + BING SEARCH (primary method — reliable for 90+ companies)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+
+def _get_browser_context(settings: Settings):
+    """Get or create a persistent browser context (reuses across all searches in a run)."""
+    global _BROWSER, _BROWSER_CONTEXT
+
+    if _BROWSER_CONTEXT is not None:
+        try:
+            _BROWSER_CONTEXT.pages  # test if still alive
+            return _BROWSER_CONTEXT
+        except Exception:
+            _BROWSER = None
+            _BROWSER_CONTEXT = None
+
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    launch_args = {
+        "headless": True,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    }
+    if settings.playwright_proxy_server:
+        launch_args["proxy"] = {"server": settings.playwright_proxy_server}
+
+    _BROWSER = pw.chromium.launch(**launch_args)
+    _BROWSER_CONTEXT = _BROWSER.new_context(
+        user_agent=random.choice(_USER_AGENTS),
+        viewport={"width": 1366, "height": 768},
+        locale="en-US",
+    )
+    # Block images/media/fonts to speed things up
+    _BROWSER_CONTEXT.route(
+        "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webm,mp3}",
+        lambda route: route.abort(),
+    )
+    return _BROWSER_CONTEXT
+
+
+def _extract_bing_results(page) -> list[tuple[str, str, str]]:
+    """Extract organic search results from Bing SERP page."""
+    results: list[tuple[str, str, str]] = []
+
     try:
-        parsed = urlparse(h)
-        qs = parse_qs(parsed.query)
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
-        if qs.get("q") and "url" in (parsed.path or "").lower():
-            return unquote(qs["q"][0])
-        if h.startswith("/url?"):
-            inner = parse_qs(parsed.query).get("q", [None])[0]
-            if inner:
-                return unquote(inner)
+        page.wait_for_selector("#b_results li.b_algo", timeout=15000)
     except Exception:
         pass
-    if h.startswith("http://") or h.startswith("https://"):
-        return h
-    return None
 
-
-def _duckduckgo_candidates_from_html(html: str) -> list[tuple[str, str, str]]:
+    html = page.content()
     soup = BeautifulSoup(html, "html.parser")
-    out: list[tuple[str, str, str]] = []
 
-    for result in soup.select("div.result, div.web-result"):
-        a = result.select_one("a.result__a[href]")
-        if not a:
+    for item in soup.select("#b_results li.b_algo"):
+        a_tag = item.select_one("h2 a[href]")
+        if not a_tag:
             continue
-        href = (a.get("href") or "").strip()
-        title = a.get_text(" ", strip=True)
-        snippet_el = result.select_one("a.result__snippet, div.result__snippet")
+        href = a_tag.get("href", "").strip()
+        if not href.startswith("http"):
+            continue
+        title = a_tag.get_text(" ", strip=True)
+        snippet_el = item.select_one(".b_caption p, .b_algoSlug")
         snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-        resolved = _resolve_result_href(href)
-        if resolved:
-            out.append((resolved, title, snippet))
+        if not _is_blocked(href):
+            results.append((href, title, snippet))
 
-    if not out:
-        for a in soup.select("a.result__a[href]"):
-            href = (a.get("href") or "").strip()
-            resolved = _resolve_result_href(href)
-            if resolved:
-                out.append((resolved, a.get_text(" ", strip=True), ""))
-
-    return out
+    return results
 
 
-def _rank_hits(company_name: str, hits: list[dict]) -> GooglePick:
-    tuples: list[tuple[str, str, str]] = []
-    for h in hits:
-        url = (h.get("href") or "").strip()
-        if not url.startswith("http") or _is_blocked(url):
-            continue
-        tuples.append((url, str(h.get("title") or ""), str(h.get("body") or "")))
-    if not tuples:
-        return GooglePick(None, "no_usable_links", "all results filtered")
-    best, score, detail = pick_best_url(company_name, tuples)
-    if not best:
-        return GooglePick(None, "low_confidence", detail)
-    return GooglePick(best, "picked", f"{detail}; score={score:.1f}")
-
-
-def _is_ratelimit_error(exc: BaseException | str) -> bool:
-    msg = str(exc).lower()
-    return "ratelimit" in msg or "rate limit" in msg or "202 ratelimit" in msg
-
-
-def _wait_ddg_cooldown(settings: Settings) -> None:
-    global _RATELIMIT_UNTIL
-    now = time.time()
-    if now < _RATELIMIT_UNTIL:
-        wait = _RATELIMIT_UNTIL - now
-        log.warning("DDG rate limit: waiting %.0f seconds before next search...", wait)
-        time.sleep(wait)
-
-
-def _mark_ddg_ratelimit(settings: Settings) -> None:
-    global _RATELIMIT_UNTIL
-    _RATELIMIT_UNTIL = time.time() + settings.ddg_ratelimit_cooldown_s
-    log.warning(
-        "DDG rate limit hit — pausing all searches for %.0f seconds.",
-        settings.ddg_ratelimit_cooldown_s,
-    )
-
-
-def _ddg_api_search(company_name: str, query: str) -> GooglePick:
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        return GooglePick(None, "ddg_api_missing", "pip install duckduckgo-search")
+def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePick:
+    """
+    Use Playwright to search Bing.com — reliable, no rate limits for 90 companies.
+    Bing is much less aggressive with CAPTCHAs than Google.
+    ~8-12s per company = ~15 min for 90 companies.
+    """
+    query = build_search_query(company_name, variant=0)
+    delay = settings.playwright_search_delay_s
 
     try:
-        with DDGS() as ddgs:
-            hits = list(ddgs.text(query, max_results=12, backend="bing"))
-            if not hits:
-                hits = list(ddgs.text(query, max_results=12, backend="auto"))
+        context = _get_browser_context(settings)
+        page = context.new_page()
+
+        try:
+            # Navigate directly to Bing search URL
+            search_url = "https://www.bing.com/search?q=" + query.replace(" ", "+") + "&setlang=en"
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Small random wait to appear human
+            time.sleep(random.uniform(1.5, 3.0))
+
+            results = _extract_bing_results(page)
+
+            if not results:
+                # Try alternate query variant
+                query2 = build_search_query(company_name, variant=2)
+                search_url2 = "https://www.bing.com/search?q=" + query2.replace(" ", "+") + "&setlang=en"
+                page.goto(search_url2, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(1.5, 2.5))
+                results = _extract_bing_results(page)
+
+            if not results:
+                # Last resort: variant 1
+                query3 = build_search_query(company_name, variant=1)
+                search_url3 = "https://www.bing.com/search?q=" + query3.replace(" ", "+") + "&setlang=en"
+                page.goto(search_url3, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(1.5, 2.5))
+                results = _extract_bing_results(page)
+
+            if not results:
+                return GooglePick(None, "bing_no_results", f"query={query}")
+
+            best, score, detail = pick_best_url(company_name, results)
+            if not best:
+                return GooglePick(None, "low_confidence", detail)
+            return GooglePick(best, "picked_bing", f"{detail}; score={score:.1f}")
+
+        finally:
+            page.close()
+            # Polite delay between searches
+            time.sleep(delay + random.uniform(0, 2.0))
+
     except Exception as e:
-        if _is_ratelimit_error(e):
-            return GooglePick(None, "ddg_ratelimit", str(e))
-        return GooglePick(None, "ddg_api_error", str(e))
-
-    if not hits:
-        return GooglePick(None, "ddg_no_results", "empty result set")
-    return _rank_hits(company_name, hits)
+        log.error("Playwright Bing error for %r: %s", company_name, e)
+        return GooglePick(None, "playwright_error", str(e)[:200])
 
 
-def _ddg_html_search(company_name: str, query: str) -> GooglePick:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-    with httpx.Client(timeout=35.0, follow_redirects=True) as client:
-        r = None
-        for attempt in range(4):
-            r = client.get("https://html.duckduckgo.com/html/", params={"q": query}, headers=headers)
-            if r.status_code == 202 and attempt < 3:
-                time.sleep(2.5 * (attempt + 1))
-                continue
-            break
-        assert r is not None
-    if r.status_code != 200:
-        return GooglePick(None, "ddg_http_error", f"status={r.status_code}")
-
-    raw = _duckduckgo_candidates_from_html(r.text)
-    tuples = [(u, t, s) for u, t, s in raw if not _is_blocked(u)]
-    if not tuples:
-        return GooglePick(None, "ddg_no_results", "html parsed but no links")
-    best, score, detail = pick_best_url(company_name, tuples)
-    if not best:
-        return GooglePick(None, "low_confidence", detail)
-    return GooglePick(best, "picked_ddg_html", f"{detail}; score={score:.1f}")
-
-
-def _discover_duckduckgo(company_name: str, settings: Settings) -> GooglePick:
-    """
-    Free search via duckduckgo-search (v8+ often uses Bing — more stable than html/lite).
-    One query per company by default; long cooldown on 202 Ratelimit.
-    """
-    _wait_ddg_cooldown(settings)
-    delay = max(5.0, settings.ddg_delay_s)
-    max_variants = max(1, min(3, settings.ddg_max_variants))
-    last: GooglePick = GooglePick(None, "not_tried", "")
-
-    for variant in range(max_variants):
-        query = build_search_query(company_name, variant=variant)
-        for attempt in range(max(1, settings.ddg_api_retries)):
-            if attempt > 0:
-                time.sleep(delay)
-
-            pick = _ddg_api_search(company_name, query)
-
-            if pick.status == "ddg_ratelimit":
-                _mark_ddg_ratelimit(settings)
-                return pick
-
-            if pick.url:
-                time.sleep(delay)
-                return GooglePick(pick.url, f"picked_v{variant}", pick.detail)
-
-            last = pick
-            if pick.status == "low_confidence":
-                break
-
-        time.sleep(delay)
-
-    if settings.ddg_use_html_fallback and last.status != "ddg_ratelimit":
-        query = build_search_query(company_name, variant=0)
-        time.sleep(delay)
-        html_pick = _ddg_html_search(company_name, query)
-        if html_pick.status == "ddg_http_error" and "202" in html_pick.detail:
-            _mark_ddg_ratelimit(settings)
-            return GooglePick(None, "ddg_ratelimit", html_pick.detail)
-        if html_pick.url:
-            return html_pick
-        last = html_pick
-
-    return last
-
+# ─────────────────────────────────────────────────────────────────────────────
+# GOOGLE CSE (paid path for 20k scale)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _discover_via_google_cse(company_name: str, query: str, settings: Settings) -> GooglePick:
     key = (settings.google_cse_api_key or "").strip()
@@ -302,7 +261,44 @@ def _discover_via_google_cse(company_name: str, query: str, settings: Settings) 
     return GooglePick(None, "cse_error", "retries exhausted")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DDG FALLBACK (kept as option but NOT recommended — rate limits)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ddg_api_search(company_name: str, query: str) -> GooglePick:
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return GooglePick(None, "ddg_api_missing", "pip install duckduckgo-search")
+    try:
+        with DDGS() as ddgs:
+            hits = list(ddgs.text(query, max_results=12, backend="auto"))
+    except Exception as e:
+        return GooglePick(None, "ddg_api_error", str(e)[:200])
+    if not hits:
+        return GooglePick(None, "ddg_no_results", "empty result set")
+    tuples: list[tuple[str, str, str]] = []
+    for h in hits:
+        url = (h.get("href") or "").strip()
+        if url.startswith("http") and not _is_blocked(url):
+            tuples.append((url, str(h.get("title") or ""), str(h.get("body") or "")))
+    if not tuples:
+        return GooglePick(None, "ddg_no_usable", "all filtered")
+    best, score, detail = pick_best_url(company_name, tuples)
+    if not best:
+        return GooglePick(None, "low_confidence", detail)
+    return GooglePick(best, "picked_ddg", f"{detail}; score={score:.1f}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def discover_official_website(company_name: str, settings: Settings) -> GooglePick:
+    """
+    Discover the official website URL for a company name.
+    Default provider: playwright_bing (Playwright + Bing search).
+    """
     name = " ".join(str(company_name).split()).strip()
     if not name:
         return GooglePick(None, "invalid_company", "empty name")
@@ -313,26 +309,41 @@ def discover_official_website(company_name: str, settings: Settings) -> GooglePi
             return GooglePick(u, "mock_google", "MOCK_GOOGLE=true")
         return GooglePick(None, "mock_google_no_url", "MOCK_WEBSITE_URL empty")
 
-    provider = (settings.search_provider or "duckduckgo").strip().lower()
-    if provider == "google":
-        provider = "playwright"
+    provider = (settings.search_provider or "playwright_bing").strip().lower()
+
+    # Aliases for backward compat
+    if provider in ("playwright", "google", "bing"):
+        provider = "playwright_bing"
 
     if provider == "cse":
         return _discover_via_google_cse(name, build_search_query(name), settings)
 
     if provider in ("duckduckgo", "ddg"):
-        return _discover_duckduckgo(name, settings)
+        time.sleep(settings.ddg_delay_s)
+        return _ddg_api_search(name, build_search_query(name))
 
-    cse_ready = bool((settings.google_cse_api_key or "").strip() and (settings.google_cse_cx or "").strip())
-    global _CSE_NOT_CONFIGURED_LOGGED
-    if provider == "auto" and cse_ready:
-        cse = _discover_via_google_cse(name, build_search_query(name), settings)
-        if cse.url:
-            return cse
-        return _discover_duckduckgo(name, settings)
+    if provider == "auto":
+        cse_ready = bool((settings.google_cse_api_key or "").strip() and (settings.google_cse_cx or "").strip())
+        if cse_ready:
+            cse = _discover_via_google_cse(name, build_search_query(name), settings)
+            if cse.url:
+                return cse
+        # Fallback to Playwright Bing
+        return _discover_playwright_bing(name, settings)
 
-    if not _CSE_NOT_CONFIGURED_LOGGED and provider == "auto":
-        log.info("Using free DuckDuckGo search (no GOOGLE_CSE_* configured).")
-        _CSE_NOT_CONFIGURED_LOGGED = True
+    # Default: playwright_bing
+    return _discover_playwright_bing(name, settings)
 
-    return _discover_duckduckgo(name, settings)
+
+def close_browser():
+    """Call at end of pipeline to cleanly close the shared browser."""
+    global _BROWSER, _BROWSER_CONTEXT
+    try:
+        if _BROWSER_CONTEXT:
+            _BROWSER_CONTEXT.close()
+        if _BROWSER:
+            _BROWSER.close()
+    except Exception:
+        pass
+    _BROWSER = None
+    _BROWSER_CONTEXT = None

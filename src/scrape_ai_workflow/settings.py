@@ -28,6 +28,7 @@ class Settings:
     ddg_use_html_fallback: bool
     ddg_ratelimit_cooldown_s: float
     ddg_max_variants: int
+    playwright_search_delay_s: float
 
 
 def load_settings() -> Settings:
@@ -59,6 +60,7 @@ def load_settings() -> Settings:
         ddg_use_html_fallback=_bool_env("DDG_USE_HTML_FALLBACK", default=False),
         ddg_ratelimit_cooldown_s=float(os.getenv("DDG_RATELIMIT_COOLDOWN_S", "120")),
         ddg_max_variants=int(os.getenv("DDG_MAX_VARIANTS", "1")),
+        playwright_search_delay_s=float(os.getenv("PLAYWRIGHT_SEARCH_DELAY_S", "6.0")),
     )
 
 

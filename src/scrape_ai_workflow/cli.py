@@ -90,8 +90,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not settings.mock_google:
         prov = settings.search_provider.strip().lower()
-        if prov == "google":
-            prov = "playwright"
+        if prov in ("google", "playwright", "bing"):
+            prov = "playwright_bing"
         cse_ok = bool(
             (settings.google_cse_api_key or "").strip() and (settings.google_cse_cx or "").strip()
         )
@@ -102,15 +102,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         if prov in ("auto", "") and cse_ok:
             print(
-                "INFO: SEARCH_PROVIDER=auto — primary search is Google Programmable Search (Custom Search JSON API).",
+                "INFO: SEARCH_PROVIDER=auto — primary search is Google CSE, fallback Playwright+Bing.",
                 file=sys.stderr,
             )
         elif prov == "cse" and cse_ok:
             print("INFO: Using Google Programmable Search only.", file=sys.stderr)
+        elif prov == "playwright_bing":
+            print(
+                "INFO: Using Playwright + Bing search (reliable, no rate limits).",
+                file=sys.stderr,
+            )
         else:
             print(
-                "INFO: Website discovery without CSE — DuckDuckGo HTML and/or Playwright "
-                "(SEARCH_PLAYWRIGHT_FALLBACK). For ~20k rows, configure GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX.",
+                f"INFO: Using search provider: {prov}",
                 file=sys.stderr,
             )
 
