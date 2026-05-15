@@ -216,7 +216,7 @@ def _extract_google_results(html: str) -> list[tuple[str, str, str]]:
 def _search_google(page, query: str) -> str:
     """Navigate to Google search and return page HTML."""
     encoded_query = query.replace(" ", "+")
-    url = f"https://www.google.com/search?q={encoded_query}&hl=en&num=15&gl=us"
+    url = f"https://www.google.com/search?q={encoded_query}&hl=en&num=20&gl=us"
     page.goto(url, wait_until="domcontentloaded", timeout=25000)
 
     # Dismiss consent/cookie popup if shown
