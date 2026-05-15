@@ -188,6 +188,9 @@ def run_pipeline(
 
         if checkpoint_path and (len(rows_out) % checkpoint_every == 0):
             save_checkpoint(checkpoint_path, cp)
+            # Also write Excel so progress is visible even if interrupted
+            write_outputs(rows_out, output_xlsx, output_csv)
+            print(f"  💾 Progress saved: {len(rows_out)} rows written to Excel.", flush=True)
 
     if checkpoint_path:
         save_checkpoint(checkpoint_path, cp)
