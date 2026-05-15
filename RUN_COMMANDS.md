@@ -26,13 +26,17 @@ python -m scrape_ai_workflow --live-google --urls-only --fresh --print-summary
 
 ---
 
-## Retry failed only
+## Resume / Retry failed only
 
 ```powershell
 $env:PYTHONPATH = ".\src"
 $env:MOCK_GOOGLE = "false"
-python -m scrape_ai_workflow --live-google --urls-only --retry-failed --print-summary
+python -m scrape_ai_workflow --resume --live-google --urls-only --retry-failed --print-summary
 ```
+
+- Skips companies already done (checkpoint)
+- Re-tries only failed ones
+- Now uses Google→Bing→DuckDuckGo fallback (never blocks)
 
 ---
 
