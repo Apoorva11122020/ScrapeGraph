@@ -398,32 +398,92 @@ def _search_ddg(query: str, browser, settings: Settings) -> list[tuple[str, str,
             pass
 
 
+def _resolve_ddg_url(href: str) -> str | None:
+    """Resolve DDG redirect URLs like //duckduckgo.com/l/?uddg=https%3A%2F%2F..."""
+    from urllib.parse import unquote, urlparse, parse_qs
+
+    if not href:
+        return None
+
+    # Direct URL (no redirect)
+    if href.startswith("http") and "duckduckgo.com" not in href:
+        return href
+
+    # DDG redirect: //duckduckgo.com/l/?uddg=ENCODED_URL
+    if "duckduckgo.com" in href and "uddg=" in href:
+        # Make it a full URL if it starts with //
+        if href.startswith("//"):
+            href = "https:" + href
+        try:
+            parsed = urlparse(href)
+            params = parse_qs(parsed.query)
+            if "uddg" in params:
+                return unquote(params["uddg"][0])
+        except Exception:
+            pass
+
+    # Try plain unquote
+    if href.startswith("http") and "duckduckgo.com" not in href:
+        return href
+
+    return None
+
+
 def _extract_results_ddg(html: str) -> list[tuple[str, str, str]]:
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
     results: list[tuple[str, str, str]] = []
     seen_hosts: set[str] = set()
 
-    for result in soup.select("div.result, div.web-result"):
-        a_tag = result.select_one("a.result__a, a.result__url, h2 a")
+    # Strategy 1: DDG result blocks (class-based)
+    for result in soup.select("div.result, div.web-result, div.results_links"):
+        # Find the main link
+        a_tag = result.select_one("a.result__a, a.result__url, h2 a, a.result-link")
         if not a_tag:
-            a_tag = result.select_one("a[href^='http']")
+            a_tag = result.select_one("a[href]")
         if not a_tag:
             continue
-        href = a_tag.get("href", "").strip()
-        # DDG sometimes uses redirect URLs
-        if "duckduckgo.com" in href:
+
+        raw_href = a_tag.get("href", "").strip()
+        href = _resolve_ddg_url(raw_href)
+        if not href or _is_blocked(href):
             continue
-        if not href.startswith("http") or _is_blocked(href):
-            continue
+
         host = _host(href)
         if host in seen_hosts:
             continue
         seen_hosts.add(host)
         title = a_tag.get_text(" ", strip=True)
-        snippet_el = result.select_one("a.result__snippet, .result__snippet")
+        snippet_el = result.select_one("a.result__snippet, .result__snippet, .result__body")
         snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
         results.append((href, title[:150], snippet[:200]))
+
+    # Strategy 2: Fallback — find all links with uddg param
+    if len(results) < 3:
+        for a_tag in soup.select("a[href*='uddg=']"):
+            raw_href = a_tag.get("href", "").strip()
+            href = _resolve_ddg_url(raw_href)
+            if not href or _is_blocked(href):
+                continue
+            host = _host(href)
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            title = a_tag.get_text(" ", strip=True)
+            results.append((href, title[:150], ""))
+
+    # Strategy 3: Any external http link not from DDG
+    if len(results) < 3:
+        for a_tag in soup.select("a[href^='http']"):
+            href = a_tag.get("href", "").strip()
+            if "duckduckgo.com" in href or _is_blocked(href):
+                continue
+            host = _host(href)
+            if host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            title = a_tag.get_text(" ", strip=True)
+            results.append((href, title[:150], ""))
 
     return results[:20]
 
