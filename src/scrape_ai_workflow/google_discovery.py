@@ -171,8 +171,15 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
     query = build_search_query(company_name, variant=0)
     delay = settings.playwright_search_delay_s
 
+    print(f"  🌐 Searching Bing: {query!r}", flush=True)
+
     try:
+        global _BROWSER
+        if _BROWSER is None:
+            print("  ⏳ Launching browser (first time, ~10s)...", flush=True)
         context = _get_browser_context(settings)
+        if _BROWSER is not None:
+            print("  ✅ Browser ready.", flush=True)
         page = context.new_page()
 
         try:
@@ -184,29 +191,37 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
             time.sleep(random.uniform(1.5, 3.0))
 
             results = _extract_bing_results(page)
+            print(f"  📋 Results found: {len(results)} (query 1)", flush=True)
 
             if not results:
                 # Try alternate query variant
                 query2 = build_search_query(company_name, variant=2)
+                print(f"  🔄 Retrying with: {query2!r}", flush=True)
                 search_url2 = "https://www.bing.com/search?q=" + query2.replace(" ", "+") + "&setlang=en"
                 page.goto(search_url2, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(random.uniform(1.5, 2.5))
                 results = _extract_bing_results(page)
+                print(f"  📋 Results found: {len(results)} (query 2)", flush=True)
 
             if not results:
                 # Last resort: variant 1
                 query3 = build_search_query(company_name, variant=1)
+                print(f"  🔄 Retrying with: {query3!r}", flush=True)
                 search_url3 = "https://www.bing.com/search?q=" + query3.replace(" ", "+") + "&setlang=en"
                 page.goto(search_url3, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(random.uniform(1.5, 2.5))
                 results = _extract_bing_results(page)
+                print(f"  📋 Results found: {len(results)} (query 3)", flush=True)
 
             if not results:
+                print(f"  ❌ No results from Bing for: {company_name!r}", flush=True)
                 return GooglePick(None, "bing_no_results", f"query={query}")
 
             best, score, detail = pick_best_url(company_name, results)
             if not best:
+                print(f"  ⚠️  Results found but low confidence (score too low)", flush=True)
                 return GooglePick(None, "low_confidence", detail)
+            print(f"  ✅ URL picked: {best}  (score={score:.1f})", flush=True)
             return GooglePick(best, "picked_bing", f"{detail}; score={score:.1f}")
 
         finally:
@@ -216,6 +231,7 @@ def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePi
 
     except Exception as e:
         log.error("Playwright Bing error for %r: %s", company_name, e)
+        print(f"  ❌ Error: {e}", flush=True)
         return GooglePick(None, "playwright_error", str(e)[:200])
 
 

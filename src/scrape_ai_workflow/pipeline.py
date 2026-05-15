@@ -74,6 +74,10 @@ def run_pipeline(
     if limit is not None:
         n = min(n, max(limit, 0))
 
+    print(f"\n{'='*55}", flush=True)
+    print(f"  🚀 Starting pipeline: {n} companies to process", flush=True)
+    print(f"{'='*55}", flush=True)
+
     for i in range(n):
         r = df.iloc[i]
         sr_no = r.get("SR NO")
@@ -86,8 +90,10 @@ def run_pipeline(
             if row_is_success(prev):
                 rows_out.append(prev)
                 stats["skipped_checkpoint"] += 1
+                print(f"\n[{i+1}/{n}] ⏭️  SKIP (checkpoint): {company_s}", flush=True)
                 continue
 
+        print(f"\n[{i+1}/{n}] 🏢 Company: {company_s}", flush=True)
         scraped_at = _utc_now_iso()
         g = discover_official_website(company_s, settings)
         website = g.url or ""
@@ -98,6 +104,7 @@ def run_pipeline(
                     url_score = part.strip().replace("score=", "")
                     break
         if not website:
+            print(f"  ❌ URL failed: {g.status} — {g.detail}", flush=True)
             row = build_output_row(
                 sr_no=sr_no,
                 company_name=company_s,
@@ -110,6 +117,7 @@ def run_pipeline(
             )
             stats[g.status] += 1
         elif urls_only:
+            print(f"  ✅ URL saved: {website}", flush=True)
             row = build_output_row(
                 sr_no=sr_no,
                 company_name=company_s,
@@ -171,6 +179,12 @@ def run_pipeline(
     close_browser()
 
     write_outputs(rows_out, output_xlsx, output_csv)
+
+    print(f"\n{'='*55}", flush=True)
+    print(f"  🏁 DONE! {len(rows_out)} rows written.", flush=True)
+    print(f"  📊 Stats: {dict(stats)}", flush=True)
+    print(f"  📁 Output: {output_xlsx}", flush=True)
+    print(f"{'='*55}\n", flush=True)
 
     summary = {
         "generated_at_utc": _utc_now_iso(),
