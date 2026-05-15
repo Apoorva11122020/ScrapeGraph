@@ -112,7 +112,7 @@ def _discover_google_search(company_name: str, settings: Settings) -> GooglePick
                 query,
                 num_results=10,
                 lang="en",
-                sleep_interval=2,
+                sleep_interval=5,
             ))
             # Filter blocked
             good_results: list[tuple[str, str, str]] = []
@@ -138,10 +138,11 @@ def _discover_google_search(company_name: str, settings: Settings) -> GooglePick
             print(f"  ⚠️  Error: {e}", flush=True)
 
             if "429" in err_str or "too many" in err_str or "http error 429" in err_str:
-                wait = random.uniform(45, 90)
+                wait = random.uniform(90, 150)
                 print(f"  ⏸️  Rate limited! Waiting {wait:.0f}s...", flush=True)
                 time.sleep(wait)
-                continue
+                # Don't retry more queries — go straight to fallback
+                break
             else:
                 time.sleep(5)
                 continue

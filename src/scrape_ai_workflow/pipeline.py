@@ -76,7 +76,13 @@ def run_pipeline(
 
     print(f"\n{'='*55}", flush=True)
     print(f"  🚀 Starting pipeline: {n} companies to process", flush=True)
+    print(f"  📦 Batch mode: 5 companies → 2 min cooldown", flush=True)
+    print(f"  ⏱️  Estimated time: ~{(n // 5 + 1) * 2 + n * 0.2:.0f} min", flush=True)
     print(f"{'='*55}", flush=True)
+
+    batch_size = 5
+    batch_cooldown_s = 120  # 2 minutes between batches
+    searches_in_batch = 0  # track actual searches (not skips)
 
     for i in range(n):
         r = df.iloc[i]
@@ -93,9 +99,20 @@ def run_pipeline(
                 print(f"\n[{i+1}/{n}] ⏭️  SKIP (checkpoint): {company_s}", flush=True)
                 continue
 
+        # Batch cooldown: after every 5 ACTUAL searches, wait 2 min
+        if searches_in_batch >= batch_size:
+            print(f"\n  ⏸️  Batch cooldown: waiting 2 minutes to avoid rate limit...", flush=True)
+            import time as _time
+            for remaining in range(batch_cooldown_s, 0, -10):
+                print(f"      ⏳ {remaining}s remaining...", flush=True)
+                _time.sleep(min(10, remaining))
+            print(f"  ▶️  Resuming searches!", flush=True)
+            searches_in_batch = 0
+
         print(f"\n[{i+1}/{n}] 🏢 Company: {company_s}", flush=True)
         scraped_at = _utc_now_iso()
         g = discover_official_website(company_s, settings)
+        searches_in_batch += 1
         website = g.url or ""
         url_score = ""
         if g.detail and "score=" in g.detail:
