@@ -90,14 +90,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not settings.mock_google:
         print(
-            "INFO: Using Google Search (googlesearch-python) — free, no API key.",
+            "INFO: Using Playwright + Google Search (headless browser, free, no API key).",
             file=sys.stderr,
         )
-        if settings.use_playwright_fallback:
-            print(
-                "INFO: Playwright fallback enabled (if Google rate-limits).",
-                file=sys.stderr,
-            )
 
     summary = run_pipeline(
         input_path=args.input,
