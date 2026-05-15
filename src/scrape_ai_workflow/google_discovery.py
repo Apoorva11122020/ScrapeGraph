@@ -1,15 +1,17 @@
+"""
+URL Discovery module — finds official website for a company name.
+
+Primary method: googlesearch-python (free, no API key needed)
+Fallback: Playwright + Google (headless browser)
+"""
 from __future__ import annotations
 
 import logging
 import random
-import re
 import time
 from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urlparse
-
-import httpx
-from bs4 import BeautifulSoup
 
 from .search_query import build_search_query
 from .settings import Settings
@@ -45,15 +47,10 @@ _DEFAULT_BLOCKED = (
     "msn.com",
 )
 
-GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
-
-# ─── Shared browser instance for Playwright (reuse across calls) ───
-_BROWSER = None
-_BROWSER_CONTEXT = None
-
 
 @dataclass(frozen=True)
 class GooglePick:
+    """Result of URL discovery — same interface used by pipeline.py"""
     url: str | None
     status: str
     detail: str
@@ -81,306 +78,167 @@ def _is_blocked(url: str, extra_blocked: Iterable[str] | None = None) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PLAYWRIGHT + BING SEARCH (primary method — reliable for 90+ companies)
+# PRIMARY: googlesearch-python (free, no API key)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
+def _discover_google_search(company_name: str, settings: Settings) -> GooglePick:
+    """
+    Use googlesearch-python to search Google.
+    Free, no API key needed. Works great for 90 companies with delays.
+    """
+    try:
+        from googlesearch import search as gsearch
+    except ImportError:
+        print("  ❌ googlesearch-python not installed! Run: pip install googlesearch-python", flush=True)
+        return GooglePick(None, "import_error", "pip install googlesearch-python")
 
+    queries = [
+        build_search_query(company_name, variant=0),
+        build_search_query(company_name, variant=1),
+        build_search_query(company_name, variant=2),
+    ]
 
-def _get_browser_context(settings: Settings):
-    """Get or create a persistent browser context (reuses across all searches in a run)."""
-    global _BROWSER, _BROWSER_CONTEXT
+    delay = settings.google_search_delay_s
 
-    if _BROWSER_CONTEXT is not None:
+    for attempt, query in enumerate(queries):
+        if attempt == 0:
+            print(f"  🌐 Google: '{query}'", flush=True)
+        else:
+            print(f"  🔄 Retry [{attempt+1}]: '{query}'", flush=True)
+
         try:
-            _BROWSER_CONTEXT.pages  # test if still alive
-            return _BROWSER_CONTEXT
-        except Exception:
-            _BROWSER = None
-            _BROWSER_CONTEXT = None
+            # googlesearch-python returns list of URLs
+            raw_results = list(gsearch(
+                query,
+                num_results=10,
+                lang="en",
+                sleep_interval=2,
+            ))
+            # Filter blocked
+            good_results: list[tuple[str, str, str]] = []
+            for url in raw_results:
+                if isinstance(url, str) and url.startswith("http") and not _is_blocked(url):
+                    good_results.append((url, "", ""))
 
-    from playwright.sync_api import sync_playwright
+            print(f"  📋 Results: {len(raw_results)} raw → {len(good_results)} usable", flush=True)
 
-    pw = sync_playwright().start()
-    launch_args = {
-        "headless": True,
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    }
-    if settings.playwright_proxy_server:
-        launch_args["proxy"] = {"server": settings.playwright_proxy_server}
+            if good_results:
+                best, score, detail = pick_best_url(company_name, good_results)
+                if best:
+                    print(f"  ✅ URL: {best}  (score={score:.1f})", flush=True)
+                    return GooglePick(best, "picked_google", f"{detail}; score={score:.1f}")
+                else:
+                    # Score too low but we have results — take first one anyway for review
+                    first_url = good_results[0][0]
+                    print(f"  ⚠️  Low confidence, using first: {first_url}", flush=True)
+                    return GooglePick(first_url, "low_confidence_picked", f"first_result; {detail}")
 
-    _BROWSER = pw.chromium.launch(**launch_args)
-    _BROWSER_CONTEXT = _BROWSER.new_context(
-        user_agent=random.choice(_USER_AGENTS),
-        viewport={"width": 1366, "height": 768},
-        locale="en-US",
-    )
-    # Block images/media/fonts to speed things up
-    _BROWSER_CONTEXT.route(
-        "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,mp4,webm,mp3}",
-        lambda route: route.abort(),
-    )
-    return _BROWSER_CONTEXT
+        except Exception as e:
+            err_str = str(e).lower()
+            print(f"  ⚠️  Error: {e}", flush=True)
 
-
-def _extract_bing_results(page) -> list[tuple[str, str, str]]:
-    """Extract organic search results from Bing SERP page — handles multiple layouts."""
-    results: list[tuple[str, str, str]] = []
-
-    # Wait for any of several possible result containers
-    try:
-        page.wait_for_selector("#b_results, .b_results, ol#b_results", timeout=15000)
-    except Exception:
-        pass
-
-    html = page.content()
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Strategy 1: Standard Bing layout
-    for item in soup.select("#b_results li.b_algo"):
-        a_tag = item.select_one("h2 a[href]")
-        if not a_tag:
-            continue
-        href = a_tag.get("href", "").strip()
-        if not href.startswith("http"):
-            continue
-        title = a_tag.get_text(" ", strip=True)
-        snippet_el = item.select_one(".b_caption p, .b_algoSlug, .b_lineclamp2, .b_lineclamp3")
-        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
-        if not _is_blocked(href):
-            results.append((href, title, snippet))
-
-    # Strategy 2: Alternate selectors (headless mode sometimes gets different markup)
-    if not results:
-        for a_tag in soup.select("li.b_algo a[href], .b_algo h2 a[href], cite + a[href]"):
-            href = a_tag.get("href", "").strip()
-            if not href.startswith("http"):
+            if "429" in err_str or "too many" in err_str or "http error 429" in err_str:
+                wait = random.uniform(45, 90)
+                print(f"  ⏸️  Rate limited! Waiting {wait:.0f}s...", flush=True)
+                time.sleep(wait)
                 continue
-            title = a_tag.get_text(" ", strip=True)
-            if not _is_blocked(href) and href not in [r[0] for r in results]:
-                results.append((href, title, ""))
-
-    # Strategy 3: Any links that look like organic results (last resort)
-    if not results:
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"].strip()
-            if not href.startswith("http"):
+            else:
+                time.sleep(5)
                 continue
-            # Skip Bing internal links
-            if "bing.com" in href or "microsoft.com" in href or "msn.com" in href:
-                continue
-            if "/search?" in href or "/images/" in href:
-                continue
-            title = a_tag.get_text(" ", strip=True)
-            if len(title) < 3:
-                continue
-            if not _is_blocked(href) and href not in [r[0] for r in results]:
-                results.append((href, title, ""))
 
-    # Debug: if still no results, log what Bing actually returned
-    if not results:
-        title_tag = soup.find("title")
-        page_title = title_tag.get_text() if title_tag else "no title"
-        log.warning("Bing returned 0 parseable results. Page title: %r, HTML length: %d", page_title, len(html))
-        # Check for cookie consent / captcha
-        if "cookie" in html.lower() or "consent" in html.lower():
-            log.warning("Bing may be showing cookie consent page — trying to dismiss...")
-            try:
-                # Try clicking accept button
-                accept_btn = page.query_selector("#bnp_btn_accept, .bnp_btn_accept, button[id*='accept']")
-                if accept_btn:
-                    accept_btn.click()
-                    time.sleep(2)
-                    # Re-extract after dismissing
-                    html = page.content()
-                    soup = BeautifulSoup(html, "html.parser")
-                    for item in soup.select("#b_results li.b_algo"):
-                        a_tag = item.select_one("h2 a[href]")
-                        if not a_tag:
-                            continue
-                        href = a_tag.get("href", "").strip()
-                        if href.startswith("http") and not _is_blocked(href):
-                            title = a_tag.get_text(" ", strip=True)
-                            results.append((href, title, ""))
-            except Exception:
-                pass
+        # Polite delay between variant queries
+        time.sleep(delay + random.uniform(1, 3))
 
-    return results
+    return GooglePick(None, "google_no_results", f"all queries failed for: {company_name}")
 
 
-def _discover_playwright_bing(company_name: str, settings: Settings) -> GooglePick:
-    """
-    Use Playwright to search Bing.com — reliable, no rate limits for 90 companies.
-    Bing is much less aggressive with CAPTCHAs than Google.
-    ~8-12s per company = ~15 min for 90 companies.
-    """
-    query = build_search_query(company_name, variant=0)
-    delay = settings.playwright_search_delay_s
+# ─────────────────────────────────────────────────────────────────────────────
+# FALLBACK: Playwright + Google (headless browser)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print(f"  🌐 Searching Bing: {query!r}", flush=True)
+_BROWSER = None
+_PW_INSTANCE = None
+
+
+def _discover_playwright_google(company_name: str, settings: Settings) -> GooglePick:
+    """Fallback: use Playwright headless browser to search Google."""
+    global _BROWSER, _PW_INSTANCE
 
     try:
-        global _BROWSER
-        if _BROWSER is None:
-            print("  ⏳ Launching browser (first time, ~10s)...", flush=True)
-        context = _get_browser_context(settings)
-        if _BROWSER is not None:
+        from playwright.sync_api import sync_playwright
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return GooglePick(None, "playwright_not_installed", "pip install playwright beautifulsoup4")
+
+    print(f"  🌐 Playwright Google fallback...", flush=True)
+
+    try:
+        if _PW_INSTANCE is None or _BROWSER is None:
+            print("  ⏳ Launching browser...", flush=True)
+            _PW_INSTANCE = sync_playwright().start()
+            _BROWSER = _PW_INSTANCE.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
             print("  ✅ Browser ready.", flush=True)
+
+        context = _BROWSER.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+        )
         page = context.new_page()
 
-        try:
-            # First visit: dismiss cookie consent if present
-            search_url = "https://www.bing.com/search?q=" + query.replace(" ", "+") + "&setlang=en&cc=us"
-            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+        query = build_search_query(company_name, variant=0)
+        search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}&hl=en&num=10"
+        page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+        time.sleep(random.uniform(2, 4))
 
-            # Try to dismiss any cookie/consent overlay
-            try:
-                accept_btn = page.query_selector("#bnp_btn_accept, .bnp_btn_accept, #bnp_ttc_close, button[id*='accept'], #consent-accept")
-                if accept_btn:
-                    accept_btn.click()
-                    print("  🍪 Dismissed cookie consent.", flush=True)
-                    time.sleep(1.5)
-            except Exception:
-                pass
+        html = page.content()
+        page.close()
+        context.close()
 
-            # Small random wait to appear human
-            time.sleep(random.uniform(1.5, 3.0))
+        soup = BeautifulSoup(html, "html.parser")
 
-            results = _extract_bing_results(page)
-            print(f"  📋 Results found: {len(results)} (query 1)", flush=True)
+        # Extract links from Google results
+        good_results: list[tuple[str, str, str]] = []
+        for a in soup.select("a[href]"):
+            href = a.get("href", "")
+            if href.startswith("http") and not _is_blocked(href):
+                title = a.get_text(" ", strip=True)[:100]
+                if len(title) > 2:
+                    good_results.append((href, title, ""))
 
-            if not results:
-                # Try alternate query variant
-                query2 = build_search_query(company_name, variant=2)
-                print(f"  🔄 Retrying with: {query2!r}", flush=True)
-                search_url2 = "https://www.bing.com/search?q=" + query2.replace(" ", "+") + "&setlang=en&cc=us"
-                page.goto(search_url2, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(random.uniform(1.5, 2.5))
-                results = _extract_bing_results(page)
-                print(f"  📋 Results found: {len(results)} (query 2)", flush=True)
+        # Deduplicate
+        seen = set()
+        deduped = []
+        for r in good_results:
+            if r[0] not in seen:
+                seen.add(r[0])
+                deduped.append(r)
+        good_results = deduped[:15]
 
-            if not results:
-                # Last resort: variant 1
-                query3 = build_search_query(company_name, variant=1)
-                print(f"  🔄 Retrying with: {query3!r}", flush=True)
-                search_url3 = "https://www.bing.com/search?q=" + query3.replace(" ", "+") + "&setlang=en&cc=us"
-                page.goto(search_url3, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(random.uniform(1.5, 2.5))
-                results = _extract_bing_results(page)
-                print(f"  📋 Results found: {len(results)} (query 3)", flush=True)
+        print(f"  📋 Playwright found: {len(good_results)} links", flush=True)
 
-            if not results:
-                print(f"  ❌ No results from Bing for: {company_name!r}", flush=True)
-                # Save debug HTML for first failure
-                try:
-                    from pathlib import Path
-                    debug_dir = Path("logs")
-                    debug_dir.mkdir(exist_ok=True)
-                    debug_file = debug_dir / "bing_debug_last.html"
-                    debug_file.write_text(page.content(), encoding="utf-8")
-                    print(f"  💾 Debug HTML saved to: {debug_file}", flush=True)
-                except Exception:
-                    pass
-                return GooglePick(None, "bing_no_results", f"query={query}")
+        if good_results:
+            best, score, detail = pick_best_url(company_name, good_results)
+            if best:
+                print(f"  ✅ URL: {best}  (score={score:.1f})", flush=True)
+                return GooglePick(best, "picked_playwright", f"{detail}; score={score:.1f}")
+            first_url = good_results[0][0]
+            print(f"  ⚠️  Low confidence, using first: {first_url}", flush=True)
+            return GooglePick(first_url, "low_confidence_playwright", detail)
 
-            best, score, detail = pick_best_url(company_name, results)
-            if not best:
-                print(f"  ⚠️  Results found but low confidence (score too low)", flush=True)
-                return GooglePick(None, "low_confidence", detail)
-            print(f"  ✅ URL picked: {best}  (score={score:.1f})", flush=True)
-            return GooglePick(best, "picked_bing", f"{detail}; score={score:.1f}")
+        # Check for CAPTCHA
+        if "sorry" in html.lower() or "captcha" in html.lower():
+            print("  🚫 Google CAPTCHA detected!", flush=True)
+            return GooglePick(None, "captcha", "Google showed CAPTCHA")
 
-        finally:
-            page.close()
-            # Polite delay between searches
-            time.sleep(delay + random.uniform(0, 2.0))
+        return GooglePick(None, "playwright_no_results", "no links found")
 
     except Exception as e:
-        log.error("Playwright Bing error for %r: %s", company_name, e)
-        print(f"  ❌ Error: {e}", flush=True)
+        print(f"  ❌ Playwright error: {e}", flush=True)
         return GooglePick(None, "playwright_error", str(e)[:200])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GOOGLE CSE (paid path for 20k scale)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _discover_via_google_cse(company_name: str, query: str, settings: Settings) -> GooglePick:
-    key = (settings.google_cse_api_key or "").strip()
-    cx = (settings.google_cse_cx or "").strip()
-    if not key or not cx:
-        return GooglePick(None, "cse_not_configured", "set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX")
-
-    time.sleep(max(0.0, settings.cse_delay_s))
-    params = {"key": key, "cx": cx, "q": query, "num": 10}
-
-    for attempt in range(3):
-        try:
-            with httpx.Client(timeout=45.0) as client:
-                r = client.get(GOOGLE_CSE_ENDPOINT, params=params)
-            if r.status_code in (429, 500, 503) and attempt < 2:
-                time.sleep(2.0 * (attempt + 1))
-                continue
-            if r.status_code != 200:
-                return GooglePick(None, "cse_error", f"http_{r.status_code}")
-            items = r.json().get("items") or []
-            tuples = []
-            for it in items:
-                link = it.get("link")
-                if isinstance(link, str) and link.startswith("http") and not _is_blocked(link):
-                    tuples.append((link, str(it.get("title") or ""), str(it.get("snippet") or "")))
-            if not tuples:
-                return GooglePick(None, "cse_no_results", "no links")
-            best, score, detail = pick_best_url(company_name, tuples)
-            if not best:
-                return GooglePick(None, "low_confidence", detail)
-            return GooglePick(best, "picked_cse", f"{detail}; score={score:.1f}")
-        except httpx.HTTPError as e:
-            if attempt < 2:
-                time.sleep(2.0)
-                continue
-            return GooglePick(None, "cse_error", str(e))
-    return GooglePick(None, "cse_error", "retries exhausted")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DDG FALLBACK (kept as option but NOT recommended — rate limits)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ddg_api_search(company_name: str, query: str) -> GooglePick:
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        return GooglePick(None, "ddg_api_missing", "pip install duckduckgo-search")
-    try:
-        with DDGS() as ddgs:
-            hits = list(ddgs.text(query, max_results=12, backend="auto"))
-    except Exception as e:
-        return GooglePick(None, "ddg_api_error", str(e)[:200])
-    if not hits:
-        return GooglePick(None, "ddg_no_results", "empty result set")
-    tuples: list[tuple[str, str, str]] = []
-    for h in hits:
-        url = (h.get("href") or "").strip()
-        if url.startswith("http") and not _is_blocked(url):
-            tuples.append((url, str(h.get("title") or ""), str(h.get("body") or "")))
-    if not tuples:
-        return GooglePick(None, "ddg_no_usable", "all filtered")
-    best, score, detail = pick_best_url(company_name, tuples)
-    if not best:
-        return GooglePick(None, "low_confidence", detail)
-    return GooglePick(best, "picked_ddg", f"{detail}; score={score:.1f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,8 +247,9 @@ def _ddg_api_search(company_name: str, query: str) -> GooglePick:
 
 def discover_official_website(company_name: str, settings: Settings) -> GooglePick:
     """
-    Discover the official website URL for a company name.
-    Default provider: playwright_bing (Playwright + Bing search).
+    Discover official website URL.
+    1. googlesearch-python (primary — free, no key)
+    2. Playwright + Google (fallback if rate limited)
     """
     name = " ".join(str(company_name).split()).strip()
     if not name:
@@ -402,41 +261,31 @@ def discover_official_website(company_name: str, settings: Settings) -> GooglePi
             return GooglePick(u, "mock_google", "MOCK_GOOGLE=true")
         return GooglePick(None, "mock_google_no_url", "MOCK_WEBSITE_URL empty")
 
-    provider = (settings.search_provider or "playwright_bing").strip().lower()
+    # Primary: googlesearch-python
+    result = _discover_google_search(name, settings)
+    if result.url:
+        return result
 
-    # Aliases for backward compat
-    if provider in ("playwright", "google", "bing"):
-        provider = "playwright_bing"
+    # Fallback: Playwright
+    if settings.use_playwright_fallback:
+        print(f"  🔄 Primary failed, trying Playwright fallback...", flush=True)
+        pw_result = _discover_playwright_google(name, settings)
+        if pw_result.url:
+            return pw_result
 
-    if provider == "cse":
-        return _discover_via_google_cse(name, build_search_query(name), settings)
-
-    if provider in ("duckduckgo", "ddg"):
-        time.sleep(settings.ddg_delay_s)
-        return _ddg_api_search(name, build_search_query(name))
-
-    if provider == "auto":
-        cse_ready = bool((settings.google_cse_api_key or "").strip() and (settings.google_cse_cx or "").strip())
-        if cse_ready:
-            cse = _discover_via_google_cse(name, build_search_query(name), settings)
-            if cse.url:
-                return cse
-        # Fallback to Playwright Bing
-        return _discover_playwright_bing(name, settings)
-
-    # Default: playwright_bing
-    return _discover_playwright_bing(name, settings)
+    return result  # Return the failed result with status/detail
 
 
 def close_browser():
-    """Call at end of pipeline to cleanly close the shared browser."""
-    global _BROWSER, _BROWSER_CONTEXT
+    """Cleanly close Playwright browser at end of pipeline."""
+    global _BROWSER, _PW_INSTANCE
     try:
-        if _BROWSER_CONTEXT:
-            _BROWSER_CONTEXT.close()
         if _BROWSER:
             _BROWSER.close()
+        if _PW_INSTANCE:
+            _PW_INSTANCE.stop()
     except Exception:
         pass
     _BROWSER = None
-    _BROWSER_CONTEXT = None
+    _PW_INSTANCE = None
+    print("🔒 Browser closed.", flush=True)

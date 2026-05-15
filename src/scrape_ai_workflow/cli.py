@@ -89,32 +89,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if not settings.mock_google:
-        prov = settings.search_provider.strip().lower()
-        if prov in ("google", "playwright", "bing"):
-            prov = "playwright_bing"
-        cse_ok = bool(
-            (settings.google_cse_api_key or "").strip() and (settings.google_cse_cx or "").strip()
+        print(
+            "INFO: Using Google Search (googlesearch-python) — free, no API key.",
+            file=sys.stderr,
         )
-        if prov == "cse" and not cse_ok:
+        if settings.use_playwright_fallback:
             print(
-                "WARN: SEARCH_PROVIDER=cse but GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX missing.",
-                file=sys.stderr,
-            )
-        if prov in ("auto", "") and cse_ok:
-            print(
-                "INFO: SEARCH_PROVIDER=auto — primary search is Google CSE, fallback Playwright+Bing.",
-                file=sys.stderr,
-            )
-        elif prov == "cse" and cse_ok:
-            print("INFO: Using Google Programmable Search only.", file=sys.stderr)
-        elif prov == "playwright_bing":
-            print(
-                "INFO: Using Playwright + Bing search (reliable, no rate limits).",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"INFO: Using search provider: {prov}",
+                "INFO: Playwright fallback enabled (if Google rate-limits).",
                 file=sys.stderr,
             )
 

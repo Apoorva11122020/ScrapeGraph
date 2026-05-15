@@ -15,20 +15,14 @@ class Settings:
     dry_run_extract: bool
     mock_google: bool
     mock_website_url: str | None
-    google_delay_min_s: float
-    google_delay_max_s: float
+    google_search_delay_s: float
+    use_playwright_fallback: bool
     playwright_proxy_server: str | None
-    search_provider: str  # auto | cse | duckduckgo | playwright | google (alias)
+    search_provider: str
     google_cse_api_key: str | None
     google_cse_cx: str | None
-    search_playwright_fallback: bool
     cse_delay_s: float
     ddg_delay_s: float
-    ddg_api_retries: int
-    ddg_use_html_fallback: bool
-    ddg_ratelimit_cooldown_s: float
-    ddg_max_variants: int
-    playwright_search_delay_s: float
 
 
 def load_settings() -> Settings:
@@ -47,20 +41,14 @@ def load_settings() -> Settings:
         dry_run_extract=_bool_env("DRY_RUN_EXTRACT", default=True),
         mock_google=_bool_env("MOCK_GOOGLE", default=True),
         mock_website_url=mock_url,
-        google_delay_min_s=float(os.getenv("GOOGLE_DELAY_MIN", "2.0")),
-        google_delay_max_s=float(os.getenv("GOOGLE_DELAY_MAX", "6.0")),
+        google_search_delay_s=float(os.getenv("GOOGLE_SEARCH_DELAY_S", "10.0")),
+        use_playwright_fallback=_bool_env("USE_PLAYWRIGHT_FALLBACK", default=True),
         playwright_proxy_server=os.getenv("PLAYWRIGHT_PROXY_SERVER") or None,
-        search_provider=(os.getenv("SEARCH_PROVIDER") or "duckduckgo").strip().lower(),
+        search_provider=(os.getenv("SEARCH_PROVIDER") or "google").strip().lower(),
         google_cse_api_key=os.getenv("GOOGLE_CSE_API_KEY") or None,
         google_cse_cx=os.getenv("GOOGLE_CSE_CX") or None,
-        search_playwright_fallback=_bool_env("SEARCH_PLAYWRIGHT_FALLBACK", default=False),
         cse_delay_s=float(os.getenv("CSE_DELAY_S", "0.25")),
         ddg_delay_s=float(os.getenv("DDG_DELAY_S", "15.0")),
-        ddg_api_retries=int(os.getenv("DDG_API_RETRIES", "1")),
-        ddg_use_html_fallback=_bool_env("DDG_USE_HTML_FALLBACK", default=False),
-        ddg_ratelimit_cooldown_s=float(os.getenv("DDG_RATELIMIT_COOLDOWN_S", "120")),
-        ddg_max_variants=int(os.getenv("DDG_MAX_VARIANTS", "1")),
-        playwright_search_delay_s=float(os.getenv("PLAYWRIGHT_SEARCH_DELAY_S", "6.0")),
     )
 
 

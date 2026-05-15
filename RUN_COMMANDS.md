@@ -1,29 +1,31 @@
-# Manual run commands (PowerShell)
+# Run Commands
 
-Project folder:
+## First-time setup (one time only)
 
 ```powershell
 cd "C:\Users\Lenovo\Desktop\ScrapeAI"
-.\.venv\Scripts\Activate.ps1   # agar venv hai
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-playwright install chromium      # <-- IMPORTANT: first time only, downloads browser
-$env:PYTHONPATH = ".\src"
+playwright install chromium          # downloads browser for fallback (~130MB)
 ```
 
-## 1) Sirf URLs dhoondho (ScrapeGraph credits nahi lagenge)
+Copy `.env.example` → `.env` (edit values as needed).
 
-Pehle yahi chalao — output check karo, phir extract.
-**Now uses Playwright + Bing (no rate limits, reliable)**
+---
+
+## 1) Find URLs only (no ScrapeGraph credits)
 
 ```powershell
-$env:SEARCH_PROVIDER = "playwright_bing"
-$env:PLAYWRIGHT_SEARCH_DELAY_S = "6"
+cd "C:\Users\Lenovo\Desktop\ScrapeAI"
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = ".\src"
 $env:MOCK_GOOGLE = "false"
 
 python -m scrape_ai_workflow `
   --input ".\apoorva trail sheet.xlsx" `
-  --output-xlsx ".\data\output\apoorva_urls_full.xlsx" `
-  --output-csv ".\data\output\apoorva_urls_full.csv" `
+  --output-xlsx ".\data\output\apoorva_urls.xlsx" `
+  --output-csv ".\data\output\apoorva_urls.csv" `
   --checkpoint ".\checkpoints\apoorva_urls.json" `
   --live-google `
   --urls-only `
@@ -32,17 +34,17 @@ python -m scrape_ai_workflow `
   --print-summary
 ```
 
-**~90 companies × 8 sec avg ≈ 12–15 min.** Internet stable rakho.
+**~90 companies × 10-12 sec = ~15-20 min.** Keep internet stable.
 
-## 2) Failed URLs dubara try (pehli run ke baad)
+---
 
-Jo rows blank / `url_failed` thi, sirf unhe dubara:
+## 2) Retry failed URLs (after first run)
 
 ```powershell
 python -m scrape_ai_workflow `
   --input ".\apoorva trail sheet.xlsx" `
-  --output-xlsx ".\data\output\apoorva_urls_full.xlsx" `
-  --output-csv ".\data\output\apoorva_urls_full.csv" `
+  --output-xlsx ".\data\output\apoorva_urls.xlsx" `
+  --output-csv ".\data\output\apoorva_urls.csv" `
   --checkpoint ".\checkpoints\apoorva_urls.json" `
   --live-google `
   --urls-only `
@@ -51,11 +53,13 @@ python -m scrape_ai_workflow `
   --print-summary
 ```
 
-(`--fresh` mat lagana — successful URLs skip ho jayengi.)
+(Don't use `--fresh` — successful URLs will be kept.)
 
-## 3) ScrapeGraph extract (jab URLs theek hon)
+---
 
-`.env` mein `SCRAPEGRAPH_API_KEY` daalo, phir:
+## 3) ScrapeGraph Extract (after URLs are verified)
+
+Set `SCRAPEGRAPH_API_KEY` in `.env`, then:
 
 ```powershell
 $env:DRY_RUN_EXTRACT = "false"
@@ -71,22 +75,48 @@ python -m scrape_ai_workflow `
   --print-summary
 ```
 
-Pehle `--limit 5`, phir poori sheet.
+Test with `--limit 5` first, then full sheet.
 
-## Output columns
+---
 
-| Column | Meaning |
-|--------|---------|
-| `website_url` | Discovered site |
-| `url_match_score` | Ranking score (higher = better match) |
-| `status` | `url_found` / `ok` / `url_failed:...` / `name_mismatch_review` |
-| `company_name_extracted` | Site se nikla naam (sheet se compare karo) |
+## Quick test (5 companies)
 
-## Tips
+```powershell
+$env:PYTHONPATH = ".\src"
+$env:MOCK_GOOGLE = "false"
+python -m scrape_ai_workflow --live-google --urls-only --limit 5 --fresh --print-summary
+```
 
-- Uses **Playwright + Bing** (NOT DuckDuckGo anymore — DDG was rate limiting at ~5% success).
-- Playwright launches a headless Chromium browser, searches Bing, extracts results.
-- First time setup: `playwright install chromium` (downloads ~130MB browser binary).
-- Galat URL se bachne ke liye score threshold hai — agar match weak ho to row **blank** rahegi (`low_confidence`), manual review ke liye.
-- If Bing blocks (unlikely for 90), increase `PLAYWRIGHT_SEARCH_DELAY_S=10` and retry failed.
-- For 20k companies later: switch to `SEARCH_PROVIDER=cse` with Google CSE keys.
+---
+
+## How it works
+
+1. **googlesearch-python** searches Google (free, no API key)
+2. Results ranked by `url_ranking.py` (blocks directories, social media)
+3. If Google rate-limits → **Playwright headless browser** fallback
+4. 10 sec delay between searches (configurable via `GOOGLE_SEARCH_DELAY_S`)
+5. Checkpoint saves progress — resume if interrupted
+
+---
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MOCK_GOOGLE` | `true` | Set `false` for real searches |
+| `GOOGLE_SEARCH_DELAY_S` | `10` | Seconds between searches |
+| `USE_PLAYWRIGHT_FALLBACK` | `true` | Use browser if Google blocks |
+| `DRY_RUN_EXTRACT` | `true` | Set `false` to use ScrapeGraph |
+| `SCRAPEGRAPH_API_KEY` | empty | Required for extract step |
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `googlesearch-python not installed` | `pip install googlesearch-python` |
+| Rate limited (429) | Increase `GOOGLE_SEARCH_DELAY_S=15` and retry |
+| CAPTCHA on Playwright | Wait 30 min, try again (rare for 90 companies) |
+| `PermissionError .xlsx` | Close the Excel file before running |
+| No output in terminal | Already fixed — shows step-by-step progress |
